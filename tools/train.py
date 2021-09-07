@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 
 from tqdm import trange, tqdm
 
-from network import LMUSIC, device
+from network import LMUSIC, device, batch_hankel, batch_music_spectrum, batch_find_peaks, batch_support_least_squares
 from tools import SparseDataset, SimpleDataset
 from torch.utils.data import DataLoader
 
@@ -16,7 +16,7 @@ def train(verbose=True):
     # signal parameters
     M, N = 64, 512
     K = 5
-    npwr = 2
+    npwr = 0.0
 
     # training parameters
     training_points = 1_000
@@ -28,7 +28,8 @@ def train(verbose=True):
     fgrid = 1/N * np.arange(N).reshape(-1, 1)
     A = np.exp(1j*2*np.pi * uniform @ fgrid.T)
 
-    model = LMUSIC(signal_dim=N, inner_dim=2*N, n_filters=16, n_layers=5)
+    # try to use to correct support
+    model = LMUSIC(signal_dim=K, n_filters=16, n_layers=20)
     model = model.to(device)
 
     if verbose: print(model, "\n")
@@ -38,39 +39,44 @@ def train(verbose=True):
     dataset_t = SparseDataset(N, K, testing_points, npwr=npwr, A=A)
     truth, data = dataset[:]
     truth_t, data_t = dataset_t[:]
-    del dataset # don't need extra copy
+    del dataset # don't need extra copies
     del dataset_t
 
     if verbose: print("Preparing Dataset:")
     if verbose: print("\tHankelizing data...", end="")
-    hankel_data = model.batch_hankel(data)
-    hankel_data_t = model.batch_hankel(data_t)
+    hankel_data = batch_hankel(data)
+    hankel_data_t = batch_hankel(data_t)
     if verbose: print("done.")
 
     if verbose: print("\tGetting MUSIC pseudospectrum...", end="")
-    spectrum_data = model.batch_music_spectrum(hankel_data, A, K)
-    spectrum_data_t = model.batch_music_spectrum(hankel_data_t, A, K)
+    spectrum_data = batch_music_spectrum(hankel_data, A, K)
+    spectrum_data_t = batch_music_spectrum(hankel_data_t, A, K)
     if verbose: print("done.")
 
     if verbose: print("\tFinding peaks...", end="")
-    peak_data = model.batch_find_peaks(spectrum_data, K)
-    peak_data_t = model.batch_find_peaks(spectrum_data_t, K)
+    peak_data = batch_find_peaks(spectrum_data, K)
+    peak_data_t = batch_find_peaks(spectrum_data_t, K)
     if verbose: print("done.")
 
-    if verbose: print("\tUsing peaks to get Least Squares solution...", end="")
-    music_data = model.batch_support_least_squares(data, peak_data, A)
-    music_data_t = model.batch_support_least_squares(data_t, peak_data_t, A)
+    if verbose: print("\tFinding peaks of ground truth...", end='')
+    truth_peak_data = batch_find_peaks(truth, K)
+    truth_peak_data_t = batch_find_peaks(truth_t, K)
     if verbose: print("done.")
+
+    #if verbose: print("\tUsing peaks to get Least Squares solution...", end="")
+    #music_data = batch_support_least_squares(data, peak_data, A)
+    #music_data_t = batch_support_least_squares(data_t, peak_data_t, A)
+    #if verbose: print("done.")
 
     # train network to correct MUSIC solutions (for now assuming amplitudes real)
     if verbose: print("Beginning Training:")
-    music_data = music_data.real.to(torch.float32).to(device)
-    music_data_t = music_data_t.real.to(torch.float32).to(device)
-    truth = truth.to(torch.float32).to(device)
-    truth_t = truth_t.to(torch.float32).to(device)
-    dataset = SimpleDataset(truth, music_data)
-    dataset_t = SimpleDataset(truth_t, music_data_t)
+    peak_data = peak_data.to(torch.float32).to(device)
+    peak_data_t = peak_data_t.to(torch.float32).to(device)
+    truth_peak_data = truth_peak_data.to(torch.float32).to(device)
+    truth_peak_data_t = truth_peak_data_t.to(torch.float32).to(device)
 
+    dataset = SimpleDataset(truth_peak_data, peak_data)
+    dataset_t = SimpleDataset(truth_peak_data_t, peak_data_t)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     dataloader_t = DataLoader(dataset_t, batch_size=testing_points, shuffle=True)
     n_batches = int(training_points/batch_size)
@@ -82,17 +88,18 @@ def train(verbose=True):
     training_losslist = np.zeros(epochs * n_batches)
     testing_losslist = np.zeros(epochs * n_batches)
 
-    #results = model(music_data)
-
     min_loss = np.inf
     for e in t_loop:
         for i, data in enumerate(dataloader):
             idx = e * n_batches + i
 
-            x_t, x_p = data
-            correction = model(x_p)
+            x_t, y = data
+            x_t /= N
+            y /= N
+            x_p = model(y)
 
-            loss = l(x_t, x_p + correction)
+            loss = l(x_t, x_p)
+            print(x_t[0], x_p[0], loss)
 
             with torch.no_grad():
                 training_losslist[idx] = loss
@@ -110,7 +117,11 @@ def train(verbose=True):
                     torch.save(model.state_dict(), "weights.pt")
                     min_loss = testing_losslist[idx]
 
-            t_loop.set_description("Batch: {}/{}, Training Loss: {}, Validation Loss: {}".format(i, len(dataloader), training_losslist[idx], testing_losslist[idx]), refresh=True)
+            #t_loop.set_description("Batch: {}/{}, Training Loss: {}, Validation Loss: {}".format(i, len(dataloader), training_losslist[idx], testing_losslist[idx]), refresh=True)
+
+            if i == 2:
+                break
+        break
 
     np.save("results/train_loss.npy", np.asarray(training_losslist))
     np.save("results/test_loss.npy", np.asarray(testing_losslist))
@@ -122,14 +133,16 @@ def train(verbose=True):
     plt.tight_layout()
     plt.savefig("results/losses.png")
 
-    #test_truth = dataset[0][0]
-    #music_pred = dataset[0][1][None]
+    if verbose: print("Training Complete.")
 
-    #model.eval()
-    #network_correction = model(music_pred)
-    #network_pred = music_pred - network_correction
+    test_truth = dataset[0][0]
+    music_pred = dataset[0][1][None]
 
-    #test_truth = test_truth.detach().cpu().numpy()
-    #music_pred = music_pred.detach().cpu().numpy().ravel()
-    #network_pred = network_pred.detach().cpu().numpy().ravel()
+    model.eval()
+    network_correction = model(music_pred)
+    network_pred = music_pred - network_correction
+
+    test_truth = test_truth.detach().cpu().numpy()
+    music_pred = music_pred.detach().cpu().numpy().ravel()
+    network_pred = network_pred.detach().cpu().numpy().ravel()
     pass
